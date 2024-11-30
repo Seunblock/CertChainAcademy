@@ -11,11 +11,25 @@
 (define-constant ERR-NOT-ENROLLED (err u106))
 (define-constant ERR-INVALID-SCORE (err u107))
 (define-constant ERR-ALREADY-CERTIFIED (err u108))
+(define-constant ERR-INVALID-INPUT (err u109))  ;; Added missing error constant
+
+;; Status Constants
+(define-constant STATUS-ACTIVE u"active")
+(define-constant STATUS-COMPLETED u"completed")
+(define-constant STATUS-DROPPED u"dropped")
 
 ;; Data variables
 (define-data-var contract-owner principal tx-sender)
 (define-data-var course-counter uint u0)
 (define-data-var enrollment-counter uint u0)
+
+;; Input validation constants
+(define-constant MIN-PRICE u0)
+(define-constant MAX-PRICE u1000000000) ;; 1 billion microstacks
+(define-constant MIN-SCORE u0)
+(define-constant MAX-SCORE u100)
+(define-constant MIN-TITLE-LENGTH u1)
+(define-constant MAX-COURSE-ID u1000000) ;; 1 million courses max
 
 ;; Data maps
 (define-map courses
@@ -37,7 +51,7 @@
         student: principal,
         course-id: uint,
         timestamp: uint,
-        status: (string-utf8 20)  ;; "active", "completed", "dropped"
+        status: (string-utf8 20)  ;; using STATUS constants
     }
 )
 
@@ -62,16 +76,29 @@
     { enrolled-students: (list 100 principal) }
 )
 
+;; Validation functions
+(define-private (is-valid-price (price uint))
+    (and (>= price MIN-PRICE) (<= price MAX-PRICE))
+)
+
+(define-private (is-valid-course-id (course-id uint))
+    (and (> course-id u0) (<= course-id MAX-COURSE-ID))
+)
+
+(define-private (is-valid-string-length (str (string-utf8 500)))
+    (> (len str) u0)
+)
+
 ;; Initialize contract
 (define-public (initialize (owner principal))
     (begin
         (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (not (is-eq owner tx-sender)) ERR-NOT-AUTHORIZED)
         (ok (var-set contract-owner owner))
     )
 )
 
 ;; Course Management Functions
-
 (define-public (create-course (title (string-utf8 100)) 
                             (description (string-utf8 500))
                             (price uint)
@@ -80,6 +107,10 @@
         ((new-course-id (+ (var-get course-counter) u1)))
         (asserts! (or (is-eq tx-sender (var-get contract-owner))
                      (is-authorized tx-sender)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-valid-string-length title) ERR-INVALID-INPUT)
+        (asserts! (is-valid-string-length description) ERR-INVALID-INPUT)
+        (asserts! (is-valid-string-length metadata-uri) ERR-INVALID-INPUT)
+        (asserts! (is-valid-price price) ERR-WRONG-PRICE)
         (map-set courses
             { course-id: new-course-id }
             {
@@ -104,7 +135,12 @@
                             (metadata-uri (string-utf8 256))
                             (active bool))
     (let ((course (unwrap! (map-get? courses { course-id: course-id }) ERR-COURSE-NOT-FOUND)))
+        (asserts! (is-valid-course-id course-id) ERR-COURSE-NOT-FOUND)
         (asserts! (is-eq tx-sender (get instructor course)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-valid-string-length title) ERR-INVALID-INPUT)
+        (asserts! (is-valid-string-length description) ERR-INVALID-INPUT)
+        (asserts! (is-valid-string-length metadata-uri) ERR-INVALID-INPUT)
+        (asserts! (is-valid-price price) ERR-WRONG-PRICE)
         (ok (map-set courses
             { course-id: course-id }
             {
@@ -120,13 +156,13 @@
 )
 
 ;; Enrollment Functions
-
 (define-public (enroll-in-course (course-id uint))
     (let
         ((course (unwrap! (map-get? courses { course-id: course-id }) ERR-COURSE-NOT-FOUND))
          (enrollment-id (+ (var-get enrollment-counter) u1))
          (current-enrollments (default-to { enrolled-courses: (list) } 
                              (map-get? student-enrollments { student: tx-sender }))))
+        (asserts! (is-valid-course-id course-id) ERR-COURSE-NOT-FOUND)
         (asserts! (get active course) ERR-COURSE-NOT-FOUND)
         (asserts! (is-none (map-get? certificates { student: tx-sender, course-id: course-id }))
                  ERR-ALREADY-CERTIFIED)
@@ -137,7 +173,7 @@
                 student: tx-sender,
                 course-id: course-id,
                 timestamp: block-height,
-                status: "active"
+                status: STATUS-ACTIVE
             }
         )
         (map-set student-enrollments
@@ -152,16 +188,19 @@
 )
 
 ;; Certification Functions
-
 (define-public (issue-certificate (student principal)
                                 (course-id uint)
                                 (score uint)
                                 (metadata-uri (string-utf8 256)))
     (let
         ((course (unwrap! (map-get? courses { course-id: course-id }) ERR-COURSE-NOT-FOUND))
-         (certificate-id (concat (to-ascii student) (to-ascii course-id))))
+         (certificate-id (concat 
+                            (concat u"CERT" (to-ascii course-id))
+                            (to-ascii block-height))))
+        (asserts! (is-valid-course-id course-id) ERR-COURSE-NOT-FOUND)
         (asserts! (is-eq (get instructor course) tx-sender) ERR-NOT-AUTHORIZED)
-        (asserts! (and (>= score u0) (<= score u100)) ERR-INVALID-SCORE)
+        (asserts! (and (>= score MIN-SCORE) (<= score MAX-SCORE)) ERR-INVALID-SCORE)
+        (asserts! (is-valid-string-length metadata-uri) ERR-INVALID-INPUT)
         (asserts! (is-none (map-get? certificates { student: student, course-id: course-id }))
                  ERR-ALREADY-CERTIFIED)
         (ok (map-set certificates
@@ -177,7 +216,6 @@
 )
 
 ;; Read-only Functions
-
 (define-read-only (get-course-details (course-id uint))
     (map-get? courses { course-id: course-id })
 )
@@ -200,13 +238,22 @@
 )
 
 ;; Private Helper Functions
-
 (define-private (is-authorized (user principal))
     (is-eq user (var-get contract-owner))
 )
 
 (define-private (to-ascii (value uint))
-    (concat "0x" (unwrap-panic (slice? (buff-to-hex (serialize-uint value)) u0 u16)))
+    (concat u"" 
+        (unwrap-panic 
+            (element-at 
+                (list 
+                    u"0" u"1" u"2" u"3" u"4" u"5" u"6" u"7" u"8" u"9" 
+                    u"A" u"B" u"C" u"D" u"E" u"F"
+                )
+                value
+            )
+        )
+    )
 )
 
 ;; Contract initialization check
